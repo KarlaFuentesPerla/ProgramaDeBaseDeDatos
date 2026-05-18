@@ -1,12 +1,29 @@
 const fs = require('fs');
+const { env } = require('../config/env');
 const backupService = require('../services/backupService');
 const restoreService = require('../services/restoreService');
 const { logSistema } = require('../utils/logger');
 
 async function list(req, res, next) {
   try {
+    const soloRestaurables =
+      req.query.restorable === '1' || req.query.restorable === 'true';
+    const data = await backupService.listBackups({ soloRestaurables });
+    res.json({
+      ok: true,
+      data,
+      retention_days: env.retentionDays || 0,
+    });
+  } catch (e) {
+    next(e);
+  }
+}
+
+async function syncCatalog(req, res, next) {
+  try {
+    const result = await backupService.syncBackupCatalog();
     const data = await backupService.listBackups();
-    res.json({ ok: true, data });
+    res.json({ ok: true, data, ...result });
   } catch (e) {
     next(e);
   }
@@ -82,4 +99,4 @@ async function download(req, res, next) {
   }
 }
 
-module.exports = { list, create, restore, download };
+module.exports = { list, syncCatalog, create, restore, download };

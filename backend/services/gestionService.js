@@ -3,15 +3,68 @@ const { queryTarget, runTarget, qualifiedTarget, pool } = require('../config/db'
 const MESA_ESTADOS = new Set(['Disponible', 'Ocupada', 'Reservada']);
 const EMPLEADO_ESTADOS = new Set(['Activo', 'Inactivo']);
 const ORDEN_ESTADOS = new Set(['Pendiente', 'Preparando', 'Servida', 'Pagada', 'Cancelada']);
+const ORDEN_ACTIVA = new Set(['Pendiente', 'Preparando', 'Servida']);
 const PAGO_METODOS = new Set(['Efectivo', 'Tarjeta', 'Transferencia', 'QR']);
+const PROPINA_PORCENTAJE = 0.1;
+
+const ORDEN_TRANSICIONES = {
+  Pendiente: new Set(['Preparando', 'Cancelada']),
+  Preparando: new Set(['Servida', 'Cancelada']),
+  Servida: new Set(['Pagada', 'Cancelada']),
+  Pagada: new Set(),
+  Cancelada: new Set(),
+};
 
 function d2(x) {
   return Math.round(Number(x) * 100) / 100;
 }
 
 async function listMesas() {
+  await sincronizarMesasSinOrdenActiva();
   const t = qualifiedTarget('mesas');
   return queryTarget(`SELECT mesa_id, numero_mesa, capacidad, estado FROM ${t} ORDER BY numero_mesa`, []);
+}
+
+async function countOrdenesActivasEnMesa(mesaId, excluirOrdenId = null) {
+  const tO = qualifiedTarget('ordenes');
+  const params = [mesaId];
+  let sql = `SELECT COUNT(*) AS n FROM ${tO}
+     WHERE mesa_id = ? AND estado IN ('Pendiente', 'Preparando', 'Servida')`;
+  if (excluirOrdenId != null) {
+    sql += ' AND orden_id <> ?';
+    params.push(excluirOrdenId);
+  }
+  const rows = await queryTarget(sql, params);
+  return Number(rows[0]?.n || 0);
+}
+
+async function syncMesaEstado(mesaId) {
+  const tM = qualifiedTarget('mesas');
+  const activas = await countOrdenesActivasEnMesa(mesaId);
+  if (activas > 0) {
+    await runTarget(`UPDATE ${tM} SET estado = 'Ocupada' WHERE mesa_id = ?`, [mesaId]);
+  } else {
+    await runTarget(`UPDATE ${tM} SET estado = 'Disponible' WHERE mesa_id = ?`, [mesaId]);
+  }
+}
+
+/** Libera la mesa si no quedan órdenes activas (p. ej. tras Pagada o Cancelada). */
+async function liberarMesaTrasCierreOrden(mesaId) {
+  await syncMesaEstado(mesaId);
+}
+
+async function sincronizarMesasSinOrdenActiva() {
+  const tM = qualifiedTarget('mesas');
+  const tO = qualifiedTarget('ordenes');
+  await runTarget(
+    `UPDATE ${tM} m SET m.estado = 'Disponible'
+     WHERE m.estado IN ('Ocupada', 'Reservada')
+     AND NOT EXISTS (
+       SELECT 1 FROM ${tO} o
+       WHERE o.mesa_id = m.mesa_id AND o.estado IN ('Pendiente', 'Preparando', 'Servida')
+     )`,
+    []
+  );
 }
 
 async function updateMesaEstado(mesaId, estado) {
@@ -21,12 +74,23 @@ async function updateMesaEstado(mesaId, estado) {
     throw e;
   }
   const t = qualifiedTarget('mesas');
-  const result = await runTarget(`UPDATE ${t} SET estado = ? WHERE mesa_id = ?`, [estado, mesaId]);
-  if (result.affectedRows === 0) {
+  const rows = await queryTarget(`SELECT mesa_id, estado FROM ${t} WHERE mesa_id = ? LIMIT 1`, [mesaId]);
+  if (!rows[0]) {
     const e = new Error('Mesa no encontrada');
     e.status = 404;
     throw e;
   }
+  if (estado === 'Disponible') {
+    const activas = await countOrdenesActivasEnMesa(mesaId);
+    if (activas > 0) {
+      const e = new Error(
+        'No se puede marcar la mesa como Disponible: tiene órdenes activas (Pendiente, Preparando o Servida). Cancélalas o márcalas como Pagadas primero.'
+      );
+      e.status = 400;
+      throw e;
+    }
+  }
+  await runTarget(`UPDATE ${t} SET estado = ? WHERE mesa_id = ?`, [estado, mesaId]);
   return queryTarget(`SELECT * FROM ${t} WHERE mesa_id = ? LIMIT 1`, [mesaId]).then((r) => r[0] || null);
 }
 
@@ -70,6 +134,132 @@ async function listPlatillos() {
      ORDER BY c.nombre, p.nombre`,
     []
   );
+}
+
+async function getPlatilloById(platilloId) {
+  const tP = qualifiedTarget('platillos');
+  const tC = qualifiedTarget('categorias');
+  const rows = await queryTarget(
+    `SELECT p.platillo_id, p.categoria_id, p.nombre, p.descripcion, p.precio, p.disponible,
+            c.nombre AS categoria_nombre
+     FROM ${tP} p
+     LEFT JOIN ${tC} c ON c.categoria_id = p.categoria_id
+     WHERE p.platillo_id = ? LIMIT 1`,
+    [platilloId]
+  );
+  return rows[0] || null;
+}
+
+async function createPlatillo(body) {
+  const nombre = body.nombre != null ? String(body.nombre).trim() : '';
+  const precio = d2(body.precio);
+  const categoria_id =
+    body.categoria_id === undefined || body.categoria_id === null || body.categoria_id === ''
+      ? null
+      : Number(body.categoria_id);
+  const descripcion = body.descripcion != null ? String(body.descripcion).trim() : null;
+  const disponible = body.disponible === false || body.disponible === 0 ? 0 : 1;
+
+  if (!nombre) {
+    const e = new Error('El nombre del platillo es obligatorio');
+    e.status = 400;
+    throw e;
+  }
+  if (!Number.isFinite(precio) || precio < 0) {
+    const e = new Error('El precio debe ser un número mayor o igual a 0');
+    e.status = 400;
+    throw e;
+  }
+  if (categoria_id != null) {
+    if (!Number.isFinite(categoria_id)) {
+      const e = new Error('categoria_id inválido');
+      e.status = 400;
+      throw e;
+    }
+    const tC = qualifiedTarget('categorias');
+    const cat = await queryTarget(`SELECT categoria_id FROM ${tC} WHERE categoria_id = ? LIMIT 1`, [
+      categoria_id,
+    ]);
+    if (!cat[0]) {
+      const e = new Error('Categoría no encontrada');
+      e.status = 404;
+      throw e;
+    }
+  }
+
+  const tP = qualifiedTarget('platillos');
+  const ins = await runTarget(
+    `INSERT INTO ${tP} (categoria_id, nombre, descripcion, precio, disponible) VALUES (?, ?, ?, ?, ?)`,
+    [categoria_id, nombre, descripcion || null, precio, disponible]
+  );
+  return getPlatilloById(ins.insertId);
+}
+
+async function updatePlatillo(platilloId, body) {
+  const existing = await getPlatilloById(platilloId);
+  if (!existing) {
+    const e = new Error('Platillo no encontrado');
+    e.status = 404;
+    throw e;
+  }
+
+  const nombre = body.nombre !== undefined ? String(body.nombre).trim() : existing.nombre;
+  const precio = body.precio !== undefined ? d2(body.precio) : d2(existing.precio);
+  const descripcion =
+    body.descripcion !== undefined
+      ? body.descripcion === null || body.descripcion === ''
+        ? null
+        : String(body.descripcion).trim()
+      : existing.descripcion;
+  let categoria_id = existing.categoria_id;
+  if (body.categoria_id !== undefined) {
+    categoria_id =
+      body.categoria_id === null || body.categoria_id === ''
+        ? null
+        : Number(body.categoria_id);
+    if (categoria_id != null) {
+      if (!Number.isFinite(categoria_id)) {
+        const e = new Error('categoria_id inválido');
+        e.status = 400;
+        throw e;
+      }
+      const tC = qualifiedTarget('categorias');
+      const cat = await queryTarget(`SELECT categoria_id FROM ${tC} WHERE categoria_id = ? LIMIT 1`, [
+        categoria_id,
+      ]);
+      if (!cat[0]) {
+        const e = new Error('Categoría no encontrada');
+        e.status = 404;
+        throw e;
+      }
+    }
+  }
+  const disponible =
+    body.disponible !== undefined
+      ? body.disponible === false || body.disponible === 0
+        ? 0
+        : 1
+      : existing.disponible
+        ? 1
+        : 0;
+
+  if (!nombre) {
+    const e = new Error('El nombre del platillo es obligatorio');
+    e.status = 400;
+    throw e;
+  }
+  if (!Number.isFinite(precio) || precio < 0) {
+    const e = new Error('El precio debe ser un número mayor o igual a 0');
+    e.status = 400;
+    throw e;
+  }
+
+  const tP = qualifiedTarget('platillos');
+  await runTarget(
+    `UPDATE ${tP} SET categoria_id = ?, nombre = ?, descripcion = ?, precio = ?, disponible = ? WHERE platillo_id = ?`,
+    [categoria_id, nombre, descripcion, precio, disponible, platilloId]
+  );
+  return getPlatilloById(platilloId);
 }
 
 async function listClientes() {
@@ -159,6 +349,49 @@ async function createOrden(body) {
   const tDet = qualifiedTarget('detalle_orden');
   const tPlat = qualifiedTarget('platillos');
   const tMesa = qualifiedTarget('mesas');
+  const tEmp = qualifiedTarget('empleados');
+
+  const [mesaRows] = await pool.execute(
+    `SELECT mesa_id, numero_mesa, estado FROM ${tMesa} WHERE mesa_id = ? LIMIT 1`,
+    [mesa_id]
+  );
+  const mesa = mesaRows[0];
+  if (!mesa) {
+    const e = new Error('Mesa no encontrada');
+    e.status = 404;
+    throw e;
+  }
+  if (mesa.estado !== 'Disponible') {
+    const e = new Error(
+      `La mesa #${mesa.numero_mesa} no está disponible (estado: ${mesa.estado}). Solo se pueden usar mesas Disponibles.`
+    );
+    e.status = 400;
+    throw e;
+  }
+  const activas = await countOrdenesActivasEnMesa(mesa_id);
+  if (activas > 0) {
+    const e = new Error(
+      `La mesa #${mesa.numero_mesa} ya tiene una orden activa. Finalízala o cancélala antes de abrir otra.`
+    );
+    e.status = 400;
+    throw e;
+  }
+
+  const [empRows] = await pool.execute(
+    `SELECT empleado_id, estado FROM ${tEmp} WHERE empleado_id = ? LIMIT 1`,
+    [empleado_id]
+  );
+  const emp = empRows[0];
+  if (!emp) {
+    const e = new Error('Empleado no encontrado');
+    e.status = 404;
+    throw e;
+  }
+  if (emp.estado !== 'Activo') {
+    const e = new Error('Solo empleados Activos pueden registrar órdenes');
+    e.status = 400;
+    throw e;
+  }
 
   const conn = await pool.getConnection();
   try {
@@ -195,13 +428,13 @@ async function createOrden(body) {
     }
 
     subtotal = d2(subtotal);
-    const impuesto = d2(subtotal * 0.16);
-    const total = d2(subtotal + impuesto);
+    const propina = d2(subtotal * PROPINA_PORCENTAJE);
+    const total = d2(subtotal + propina);
 
     const [ins] = await conn.execute(
       `INSERT INTO ${tOrd} (mesa_id, empleado_id, cliente_id, estado, subtotal, impuesto, total)
        VALUES (?, ?, ?, 'Pendiente', ?, ?, ?)`,
-      [mesa_id, empleado_id, cliente_id, subtotal, impuesto, total]
+      [mesa_id, empleado_id, cliente_id, subtotal, propina, total]
     );
     const ordenId = ins.insertId;
 
@@ -233,17 +466,54 @@ async function updateOrdenEstado(ordenId, estado) {
 
   const tO = qualifiedTarget('ordenes');
   const tM = qualifiedTarget('mesas');
-  const rows = await queryTarget(`SELECT mesa_id FROM ${tO} WHERE orden_id = ? LIMIT 1`, [ordenId]);
+  const rows = await queryTarget(`SELECT mesa_id, estado FROM ${tO} WHERE orden_id = ? LIMIT 1`, [ordenId]);
   if (!rows[0]) {
     const e = new Error('Orden no encontrada');
     e.status = 404;
     throw e;
   }
   const mesaId = rows[0].mesa_id;
+  const actual = rows[0].estado;
+
+  if (actual === estado) {
+    if (estado === 'Pagada' || estado === 'Cancelada') {
+      await liberarMesaTrasCierreOrden(mesaId);
+    }
+    return getOrdenCompleta(ordenId);
+  }
+
+  const permitidos = ORDEN_TRANSICIONES[actual];
+  if (!permitidos || !permitidos.has(estado)) {
+    const e = new Error(
+      `No se puede cambiar la orden de "${actual}" a "${estado}". Transiciones válidas: ${permitidos && permitidos.size ? [...permitidos].join(', ') : 'ninguna'}`
+    );
+    e.status = 400;
+    throw e;
+  }
+
+  if (estado === 'Pagada') {
+    const tPg = qualifiedTarget('pagos');
+    const sums = await queryTarget(`SELECT COALESCE(SUM(monto), 0) AS s FROM ${tPg} WHERE orden_id = ?`, [
+      ordenId,
+    ]);
+    const ordenRow = await queryTarget(`SELECT total FROM ${tO} WHERE orden_id = ? LIMIT 1`, [ordenId]);
+    const totalPagado = d2(sums[0]?.s);
+    const totalOrden = d2(ordenRow[0]?.total);
+    if (totalPagado + 0.005 < totalOrden) {
+      const e = new Error(
+        `No se puede marcar como Pagada: faltan $${(totalOrden - totalPagado).toFixed(2)} por registrar en pagos.`
+      );
+      e.status = 400;
+      throw e;
+    }
+  }
 
   await runTarget(`UPDATE ${tO} SET estado = ? WHERE orden_id = ?`, [estado, ordenId]);
+
   if (estado === 'Cancelada' || estado === 'Pagada') {
-    await runTarget(`UPDATE ${tM} SET estado = 'Disponible' WHERE mesa_id = ?`, [mesaId]);
+    await liberarMesaTrasCierreOrden(mesaId);
+  } else if (ORDEN_ACTIVA.has(estado)) {
+    await runTarget(`UPDATE ${tM} SET estado = 'Ocupada' WHERE mesa_id = ?`, [mesaId]);
   }
 
   return getOrdenCompleta(ordenId);
@@ -302,11 +572,15 @@ async function registrarPago(ordenId, metodo_pago, monto) {
 
     if (totalPagado + 0.005 >= totalOrden) {
       await conn.execute(`UPDATE ${tO} SET estado = 'Pagada' WHERE orden_id = ?`, [ordenId]);
-      await conn.execute(`UPDATE ${tM} SET estado = 'Disponible' WHERE mesa_id = ?`, [orden.mesa_id]);
     }
 
     await conn.commit();
-    return getOrdenCompleta(ordenId);
+
+    const ordenFinal = await getOrdenCompleta(ordenId);
+    if (ordenFinal?.orden?.estado === 'Pagada') {
+      await liberarMesaTrasCierreOrden(orden.mesa_id);
+    }
+    return ordenFinal;
   } catch (e) {
     await conn.rollback();
     throw e;
@@ -322,11 +596,15 @@ module.exports = {
   updateEmpleadoEstado,
   listCategorias,
   listPlatillos,
+  getPlatilloById,
+  createPlatillo,
+  updatePlatillo,
   listClientes,
   listOrdenes,
   getOrdenCompleta,
   createOrden,
   updateOrdenEstado,
   registrarPago,
+  ORDEN_TRANSICIONES,
 };
 

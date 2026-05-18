@@ -5,6 +5,7 @@ const { promisify } = require('util');
 const { env } = require('../config/env');
 const { decryptFile } = require('../utils/encryption');
 const { logSistema } = require('../utils/logger');
+const { queryMetadata, qualifiedMetadata } = require('../config/db');
 const backupService = require('./backupService');
 
 const execFileAsync = promisify(execFile);
@@ -40,25 +41,12 @@ async function runMysqlImport(sqlPath) {
 }
 
 async function restoreVersion(versionId) {
-  const row = await backupService.getBackupById(versionId);
-  if (!row) {
-    const e = new Error('Versión no encontrada');
-    e.status = 404;
-    throw e;
-  }
-  if (row.estado !== 'completado') {
-    const e = new Error('Solo se pueden restaurar versiones completadas');
-    e.status = 400;
-    throw e;
-  }
+  const row = await backupService.assertVersionRestorable(versionId);
+  const t = qualifiedMetadata('versiones_bd');
+  const preservedCatalog = await queryMetadata(`SELECT * FROM ${t} WHERE version_id != ?`, [versionId]);
 
   const encPath = backupService.resolveStoredFile(encryptedDir, row.archivo_encriptado);
   const sqlPath = backupService.resolveStoredFile(backupsDir, row.archivo_backup);
-  if (!fs.existsSync(encPath) && !fs.existsSync(sqlPath)) {
-    const e = new Error('Archivos de respaldo no encontrados en disco');
-    e.status = 404;
-    throw e;
-  }
 
   if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
   const decPath = path.join(tempDir, `restore_${versionId}_${Date.now()}.sql`);
@@ -78,11 +66,13 @@ async function restoreVersion(versionId) {
       await runMysqlImport(sqlPath);
     }
 
+    await backupService.finalizeRestoreCatalog(versionId, preservedCatalog, row);
+
     await logSistema({
       tipo: 'RESTORE',
       mensaje: `Restauración completada para ${row.version_nombre}`,
-      detalle: { versionId },
-      version_id: versionId,
+      detalle: { versionId, preservedVersions: preservedCatalog.length },
+      version_id: null,
     });
 
     return { version_id: versionId, version_nombre: row.version_nombre, target_database: env.backupTargetDatabase };

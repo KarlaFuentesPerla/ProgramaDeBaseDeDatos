@@ -32,9 +32,14 @@ const server = app.listen(env.port, async () => {
   );
   console.log(`[backup] mysqldump: ${env.mysqldumpPath}`);
   try {
-    const { reconcileStuckBackups } = require('./services/backupService');
-    const n = await reconcileStuckBackups();
-    if (n > 0) console.warn(`[backup] ${n} versión(es) pendiente(s) marcada(s) como error`);
+    const { syncBackupCatalog } = require('./services/backupService');
+    const { purged, reconciled } = await syncBackupCatalog();
+    if (reconciled > 0) {
+      console.log(`[backup] ${reconciled} versión(es) recuperada(s) como completadas (archivos en disco)`);
+    }
+    if (purged > 0) {
+      console.warn(`[backup] ${purged} versión(es) sin archivos eliminada(s) del catálogo`);
+    }
     await logSistema({
       tipo: 'SYSTEM_START',
       mensaje: 'Servidor de versionado y respaldo iniciado',

@@ -169,9 +169,94 @@ async function createBackup({ descripcion = '', triggeredBy = 'api' } = {}) {
   }
 }
 
-async function listBackups() {
+async function purgeVersionsWithoutFiles() {
   const t = qualifiedMetadata('versiones_bd');
-  return queryMetadata(`SELECT * FROM ${t} ORDER BY version_id DESC`, []);
+  const rows = await queryMetadata(`SELECT * FROM ${t} ORDER BY version_id`, []);
+  let removed = 0;
+  for (const row of rows) {
+    if (row.estado === 'pendiente') continue;
+    if (versionFilesExist(row)) continue;
+    deleteVersionFiles(row);
+    await runMetadata(`DELETE FROM ${t} WHERE version_id = ?`, [row.version_id]);
+    await logSistema({
+      tipo: 'CLEANUP',
+      mensaje: `Versión ${row.version_nombre} eliminada del catálogo (sin archivos en disco)`,
+      detalle: {
+        archivo_backup: row.archivo_backup,
+        archivo_encriptado: row.archivo_encriptado,
+      },
+      version_id: row.version_id,
+    });
+    removed += 1;
+  }
+  return removed;
+}
+
+async function reconcileVersionsWithValidFiles() {
+  const t = qualifiedMetadata('versiones_bd');
+  const rows = await queryMetadata(
+    `SELECT * FROM ${t} WHERE estado IN ('error', 'pendiente') ORDER BY version_id`,
+    []
+  );
+  let fixed = 0;
+  for (const row of rows) {
+    const filePath = versionFilePath(row);
+    if (!filePath || fs.statSync(filePath).size < MIN_BACKUP_BYTES) continue;
+    const mb = fileSizeMb(filePath);
+    await runMetadata(
+      `UPDATE ${t} SET estado = 'completado', tamano_archivo_mb = ? WHERE version_id = ?`,
+      [mb.toFixed(2), row.version_id]
+    );
+    await logSistema({
+      tipo: 'CLEANUP',
+      mensaje: `Versión ${row.version_nombre} marcada como completada (archivos válidos en disco)`,
+      version_id: row.version_id,
+    });
+    fixed += 1;
+  }
+  return fixed;
+}
+
+async function syncBackupCatalog() {
+  await applyRetention();
+  await reconcileStuckBackups();
+  const reconciled = await reconcileVersionsWithValidFiles();
+  const purged = await purgeVersionsWithoutFiles();
+  return { purged, reconciled };
+}
+
+async function listBackups({ soloRestaurables = false } = {}) {
+  await syncBackupCatalog();
+  const t = qualifiedMetadata('versiones_bd');
+  const rows = await queryMetadata(`SELECT * FROM ${t} ORDER BY version_id DESC`, []);
+  const enriched = rows.map(enrichVersion);
+  if (soloRestaurables) {
+    return enriched.filter((v) => v.puede_restaurar);
+  }
+  return enriched;
+}
+
+async function assertVersionRestorable(versionId) {
+  const row = await getBackupById(versionId);
+  if (!row) {
+    const e = new Error('Versión no encontrada');
+    e.status = 404;
+    throw e;
+  }
+  if (row.estado !== 'completado') {
+    const e = new Error('Solo se pueden restaurar versiones completadas');
+    e.status = 400;
+    throw e;
+  }
+  if (!versionFilesExist(row)) {
+    await purgeVersionsWithoutFiles();
+    const e = new Error(
+      `Los archivos de ${row.version_nombre} ya no están en el servidor (retención de ${env.retentionDays} días o fueron eliminados). Se quitó del listado.`
+    );
+    e.status = 404;
+    throw e;
+  }
+  return row;
 }
 
 async function getBackupById(id) {
@@ -184,6 +269,41 @@ function resolveStoredFile(baseDir, storedName) {
   if (!storedName) return null;
   const base = path.basename(String(storedName).replace(/\\/g, '/'));
   return path.join(baseDir, base);
+}
+
+const MIN_BACKUP_BYTES = 512;
+
+function versionFilePath(row) {
+  if (!row) return null;
+  const encPath = resolveStoredFile(encryptedDir, row.archivo_encriptado);
+  if (encPath && fs.existsSync(encPath)) return encPath;
+  const sqlPath = resolveStoredFile(backupsDir, row.archivo_backup);
+  if (sqlPath && fs.existsSync(sqlPath)) return sqlPath;
+  return null;
+}
+
+function versionFilesExist(row) {
+  const filePath = versionFilePath(row);
+  if (!filePath) return false;
+  return fs.statSync(filePath).size >= MIN_BACKUP_BYTES;
+}
+
+function enrichVersion(row) {
+  const archivos = versionFilesExist(row);
+  const puedeRestaurar = row.estado === 'completado' && archivos;
+  let diasRestantes = null;
+  if (env.retentionDays > 0 && row.fecha_backup) {
+    const limite = new Date(row.fecha_backup);
+    limite.setDate(limite.getDate() + env.retentionDays);
+    diasRestantes = Math.max(0, Math.ceil((limite.getTime() - Date.now()) / 86400000));
+  }
+  return {
+    ...row,
+    archivos_en_disco: archivos,
+    puede_restaurar: puedeRestaurar,
+    puede_exportar: puedeRestaurar,
+    dias_restantes_retencion: diasRestantes,
+  };
 }
 
 function deleteVersionFiles(row) {
@@ -212,17 +332,7 @@ async function applyRetention() {
 }
 
 async function prepareDownload(versionId, format = 'enc') {
-  const row = await getBackupById(versionId);
-  if (!row) {
-    const e = new Error('Versión no encontrada');
-    e.status = 404;
-    throw e;
-  }
-  if (row.estado !== 'completado') {
-    const e = new Error('Solo se pueden exportar versiones completadas');
-    e.status = 400;
-    throw e;
-  }
+  const row = await assertVersionRestorable(versionId);
 
   const encPath = resolveStoredFile(encryptedDir, row.archivo_encriptado);
   const sqlPath = resolveStoredFile(backupsDir, row.archivo_backup);
@@ -290,14 +400,71 @@ async function reconcileStuckBackups() {
   return stuck.length;
 }
 
+/** Tras restaurar: conserva el catálogo de otras versiones y quita solo la consumida. */
+async function finalizeRestoreCatalog(consumedVersionId, preservedRows, consumedRow) {
+  const t = qualifiedMetadata('versiones_bd');
+  const ids = (preservedRows || []).map((r) => r.version_id);
+
+  if (ids.length > 0) {
+    const placeholders = ids.map(() => '?').join(',');
+    await runMetadata(`DELETE FROM ${t} WHERE version_id NOT IN (${placeholders})`, ids);
+  } else {
+    await runMetadata(`DELETE FROM ${t}`);
+  }
+
+  for (const row of preservedRows || []) {
+    await runMetadata(
+      `INSERT INTO ${t}
+        (version_id, version_nombre, fecha_backup, descripcion, archivo_backup, archivo_encriptado, tamano_archivo_mb, estado)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         version_nombre = VALUES(version_nombre),
+         fecha_backup = VALUES(fecha_backup),
+         descripcion = VALUES(descripcion),
+         archivo_backup = VALUES(archivo_backup),
+         archivo_encriptado = VALUES(archivo_encriptado),
+         tamano_archivo_mb = VALUES(tamano_archivo_mb),
+         estado = VALUES(estado)`,
+      [
+        row.version_id,
+        row.version_nombre,
+        row.fecha_backup,
+        row.descripcion,
+        row.archivo_backup,
+        row.archivo_encriptado,
+        row.tamano_archivo_mb,
+        row.estado,
+      ]
+    );
+  }
+
+  const consumed = consumedRow || (await getBackupById(consumedVersionId));
+  if (consumed) deleteVersionFiles(consumed);
+  await runMetadata(`DELETE FROM ${t} WHERE version_id = ?`, [consumedVersionId]);
+
+  await logSistema({
+    tipo: 'RESTORE',
+    mensaje: `Versión ${consumed?.version_nombre || consumedVersionId} retirada del catálogo tras restauración`,
+    version_id: null,
+    detalle: { consumedVersionId, preservedCount: preservedRows?.length || 0 },
+  });
+}
+
 module.exports = {
   createBackup,
   listBackups,
   getBackupById,
   prepareDownload,
+  assertVersionRestorable,
   isBackupRunning,
   applyRetention,
   reconcileStuckBackups,
+  reconcileVersionsWithValidFiles,
+  purgeVersionsWithoutFiles,
+  syncBackupCatalog,
+  finalizeRestoreCatalog,
+  versionFilesExist,
+  enrichVersion,
   resolveStoredFile,
   backupsDir,
   encryptedDir,

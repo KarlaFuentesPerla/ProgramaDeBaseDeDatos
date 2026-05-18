@@ -124,7 +124,7 @@ CREATE TABLE ordenes (
   fecha_orden DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   estado ENUM('Pendiente', 'Preparando', 'Servida', 'Pagada', 'Cancelada') NOT NULL DEFAULT 'Pendiente',
   subtotal DECIMAL(10,2) NOT NULL DEFAULT 0,
-  impuesto DECIMAL(10,2) NOT NULL DEFAULT 0,
+  impuesto DECIMAL(10,2) NOT NULL DEFAULT 0 COMMENT 'Propina (10% del subtotal)',
   total DECIMAL(10,2) NOT NULL DEFAULT 0,
   PRIMARY KEY (orden_id),
   KEY idx_orden_mesa (mesa_id),
@@ -186,8 +186,8 @@ INSERT INTO platillos (categoria_id, nombre, descripcion, precio, disponible) VA
 (4, 'Agua fresca', '1 L', 35.00, 1);
 
 INSERT INTO ordenes (mesa_id, empleado_id, cliente_id, estado, subtotal, impuesto, total) VALUES
-(3, 2, 1, 'Pagada', 240.00, 38.40, 278.40),
-(8, 2, 2, 'Servida', 145.00, 23.20, 168.20);
+(3, 2, 1, 'Pagada', 240.00, 24.00, 264.00),
+(8, 2, 2, 'Servida', 145.00, 14.50, 159.50);
 
 INSERT INTO detalle_orden (orden_id, platillo_id, cantidad, precio_unitario, subtotal) VALUES
 (1, 1, 2, 95.00, 190.00), (1, 6, 2, 35.00, 70.00), (2, 3, 1, 145.00, 145.00);

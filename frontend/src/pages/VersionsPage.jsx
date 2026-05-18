@@ -13,7 +13,8 @@ export default function VersionsPage() {
   async function load() {
     setError('');
     try {
-      setRows(await getBackups());
+      const list = await getBackups();
+      setRows(list.filter((r) => r.puede_restaurar || r.estado === 'pendiente'));
     } catch (e) {
       setError(e?.response?.data?.error || e.message || 'Error al cargar versiones');
     }
@@ -53,7 +54,21 @@ export default function VersionsPage() {
         label: 'Fecha',
         render: (r) => new Date(r.fecha_backup).toLocaleString(),
       },
-      { key: 'estado', label: 'Estado', render: (r) => <StatusBadge status={r.estado} /> },
+      {
+        key: 'estado',
+        label: 'Estado',
+        render: (r) => (
+          <span className="flex flex-col gap-1">
+            <StatusBadge status={r.estado} />
+            {r.estado === 'completado' && r.archivos_en_disco === false ? (
+              <span className="text-xs text-rose-400">Sin archivo (se eliminará al refrescar)</span>
+            ) : null}
+            {r.dias_restantes_retencion != null && r.archivos_en_disco ? (
+              <span className="text-xs text-zinc-500">{r.dias_restantes_retencion} d de retención</span>
+            ) : null}
+          </span>
+        ),
+      },
       {
         key: 'tamano_archivo_mb',
         label: 'Tamaño (MB)',
@@ -64,7 +79,7 @@ export default function VersionsPage() {
         key: 'acciones',
         label: 'Acciones',
         render: (r) => {
-          const canExport = r.estado === 'completado';
+          const canExport = r.puede_exportar === true || (r.estado === 'completado' && r.archivos_en_disco !== false);
           const busyEnc = exportingId === `${r.version_id}-enc`;
           const busySql = exportingId === `${r.version_id}-sql`;
           if (!canExport) {

@@ -5,6 +5,8 @@ const router = express.Router();
 
 router.get('/categorias', c.categoriasList);
 router.get('/platillos', c.platillosList);
+router.post('/platillos', c.platilloCreate);
+router.patch('/platillos/:id', c.platilloPatch);
 router.get('/clientes', c.clientesList);
 
 router.get('/mesas', c.mesasList);

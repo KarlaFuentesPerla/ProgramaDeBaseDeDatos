@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import PageHeader from '../components/PageHeader.jsx';
 import DataTable from '../components/DataTable.jsx';
+import PlatillosCatalog from '../components/PlatillosCatalog.jsx';
 import StatusBadge from '../components/StatusBadge.jsx';
 import {
+  getApiErrorMessage,
+  getCategoriasGestion,
   getClientesGestion,
   getEmpleados,
   getMesas,
@@ -12,14 +15,28 @@ import {
   patchEmpleadoEstado,
   patchMesaEstado,
   patchOrdenEstado,
+  patchPlatillo,
   postOrden,
   postOrdenPago,
+  postPlatillo,
 } from '../services/api.js';
 
 const mesaEstados = ['Disponible', 'Ocupada', 'Reservada'];
 const empEstados = ['Activo', 'Inactivo'];
-const ordenEstados = ['Pendiente', 'Preparando', 'Servida', 'Pagada', 'Cancelada'];
 const metodosPago = ['Efectivo', 'Tarjeta', 'Transferencia', 'QR'];
+
+const ordenTransiciones = {
+  Pendiente: ['Preparando', 'Cancelada'],
+  Preparando: ['Servida', 'Cancelada'],
+  Servida: ['Pagada', 'Cancelada'],
+  Pagada: [],
+  Cancelada: [],
+};
+
+function estadosOrdenPermitidos(actual) {
+  const next = ordenTransiciones[actual] || [];
+  return [actual, ...next.filter((s) => s !== actual)];
+}
 
 const tabs = [
   { id: 'salon', label: 'Mesas y empleados' },
@@ -33,6 +50,15 @@ export default function GestionPage() {
   const [mesas, setMesas] = useState([]);
   const [empleados, setEmpleados] = useState([]);
   const [platillos, setPlatillos] = useState([]);
+  const [categorias, setCategorias] = useState([]);
+  const [nuevoPlat, setNuevoPlat] = useState({
+    nombre: '',
+    precio: '',
+    categoria_id: '',
+    descripcion: '',
+    disponible: true,
+  });
+  const [platBusy, setPlatBusy] = useState('');
   const [clientes, setClientes] = useState([]);
   const [ordenes, setOrdenes] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -59,8 +85,9 @@ export default function GestionPage() {
   }, []);
 
   const loadCatalogo = useCallback(async () => {
-    const p = await getPlatillosGestion();
+    const [p, c] = await Promise.all([getPlatillosGestion(), getCategoriasGestion()]);
     setPlatillos(p);
+    setCategorias(c);
   }, []);
 
   const loadOrdenesTab = useCallback(async () => {
@@ -97,7 +124,7 @@ export default function GestionPage() {
         setPlatillos(p);
       } else if (tab === 'ordenes') await loadOrdenesTab();
     } catch (err) {
-      setError(err?.response?.data?.error || err.message || 'Error al cargar datos');
+      setError(await getApiErrorMessage(err, 'Error al cargar datos'));
     } finally {
       setLoading(false);
     }
@@ -202,16 +229,54 @@ export default function GestionPage() {
     [busyKey, load]
   );
 
-  const colsPlat = useMemo(
-    () => [
-      { key: 'platillo_id', label: 'ID' },
-      { key: 'nombre', label: 'Platillo' },
-      { key: 'categoria_nombre', label: 'Categoría', render: (r) => r.categoria_nombre || '—' },
-      { key: 'precio', label: 'Precio', render: (r) => Number(r.precio).toFixed(2) },
-      { key: 'disponible', label: 'En menú', render: (r) => (r.disponible ? 'Sí' : 'No') },
-    ],
-    []
-  );
+  async function guardarPlatillo(row) {
+    setPlatBusy(`p${row.platillo_id}`);
+    setError('');
+    try {
+      await patchPlatillo(row.platillo_id, {
+        nombre: row.nombre,
+        precio: Number(row.precio),
+        categoria_id: row.categoria_id === '' ? null : Number(row.categoria_id),
+        descripcion: row.descripcion || null,
+        disponible: !!row.disponible,
+      });
+      await loadCatalogo();
+    } catch (err) {
+      setError(await getApiErrorMessage(err, 'No se pudo actualizar el platillo'));
+    } finally {
+      setPlatBusy('');
+    }
+  }
+
+  async function crearPlatillo() {
+    setPlatBusy('new');
+    setError('');
+    try {
+      if (!nuevoPlat.nombre.trim()) {
+        setError('El nombre del platillo es obligatorio.');
+        return;
+      }
+      await postPlatillo({
+        nombre: nuevoPlat.nombre.trim(),
+        precio: Number(nuevoPlat.precio) || 0,
+        categoria_id: nuevoPlat.categoria_id === '' ? null : Number(nuevoPlat.categoria_id),
+        descripcion: nuevoPlat.descripcion.trim() || null,
+        disponible: nuevoPlat.disponible,
+      });
+      setNuevoPlat({ nombre: '', precio: '', categoria_id: '', descripcion: '', disponible: true });
+      await loadCatalogo();
+    } catch (err) {
+      setError(await getApiErrorMessage(err, 'No se pudo crear el platillo'));
+    } finally {
+      setPlatBusy('');
+    }
+  }
+
+  function actualizarPlatilloLocal(id, field, value) {
+    setPlatillos((prev) =>
+      prev.map((p) => (p.platillo_id === id ? { ...p, [field]: value } : p))
+    );
+  }
 
   const colsOrdenes = useMemo(
     () => [
@@ -221,31 +286,35 @@ export default function GestionPage() {
       {
         key: 'estado',
         label: 'Estado',
-        render: (r) => (
-          <select
-            className="max-w-[140px] rounded-lg border border-zinc-700 bg-zinc-900 px-1 py-1 text-xs text-zinc-100"
-            value={r.estado}
-            disabled={busyKey === `o${r.orden_id}`}
-            onChange={async (ev) => {
-              const nuevo = ev.target.value;
-              setBusyKey(`o${r.orden_id}`);
-              try {
-                await patchOrdenEstado(r.orden_id, nuevo);
-                await load();
-              } catch (err) {
-                setError(err?.response?.data?.error || err.message || 'Error al actualizar orden');
-              } finally {
-                setBusyKey('');
-              }
-            }}
-          >
-            {ordenEstados.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-        ),
+        render: (r) => {
+          const opciones = estadosOrdenPermitidos(r.estado);
+          return (
+            <select
+              className="max-w-[140px] rounded-lg border border-zinc-700 bg-zinc-900 px-1 py-1 text-xs text-zinc-100"
+              value={r.estado}
+              disabled={busyKey === `o${r.orden_id}` || opciones.length <= 1}
+              onChange={async (ev) => {
+                const nuevo = ev.target.value;
+                if (nuevo === r.estado) return;
+                setBusyKey(`o${r.orden_id}`);
+                try {
+                  await patchOrdenEstado(r.orden_id, nuevo);
+                  await load();
+                } catch (err) {
+                  setError(await getApiErrorMessage(err, 'Error al actualizar orden'));
+                } finally {
+                  setBusyKey('');
+                }
+              }}
+            >
+              {opciones.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          );
+        },
       },
       {
         key: 'total',
@@ -285,6 +354,11 @@ export default function GestionPage() {
         setError('Selecciona mesa y empleado.');
         return;
       }
+      const mesaSel = mesas.find((m) => String(m.mesa_id) === String(mesaId));
+      if (!mesaSel || mesaSel.estado !== 'Disponible') {
+        setError('La mesa seleccionada no está disponible (ocupada o reservada).');
+        return;
+      }
       if (items.length === 0) {
         setError('Agrega al menos un platillo.');
         return;
@@ -297,9 +371,10 @@ export default function GestionPage() {
       };
       await postOrden(payload);
       setLineas([{ platillo_id: '', cantidad: 1 }]);
+      setMesaId('');
       setTab('ordenes');
     } catch (err) {
-      setError(err?.response?.data?.error || err.message || 'No se pudo crear la orden');
+      setError(await getApiErrorMessage(err, 'No se pudo crear la orden'));
     } finally {
       setNuevaBusy(false);
     }
@@ -385,21 +460,29 @@ export default function GestionPage() {
         </div>
       )}
 
-      {tab === 'catalogo' && (
-        <section className="space-y-3">
-          <h2 className="text-lg font-semibold text-white">Platillos disponibles para órdenes</h2>
-          {loading ? (
-            <div className="h-40 animate-pulse rounded-2xl border border-zinc-800 bg-zinc-900/40" />
-          ) : (
-            <DataTable columns={colsPlat} rows={platillos} rowKey={(r) => r.platillo_id} />
-          )}
-        </section>
-      )}
+      {tab === 'catalogo' &&
+        (loading ? (
+          <div className="h-40 animate-pulse rounded-2xl border border-zinc-800 bg-zinc-900/40" />
+        ) : (
+          <PlatillosCatalog
+            platillos={platillos}
+            categorias={categorias}
+            nuevoPlat={nuevoPlat}
+            setNuevoPlat={setNuevoPlat}
+            platBusy={platBusy}
+            onCrear={crearPlatillo}
+            onLocalChange={actualizarPlatilloLocal}
+            onSave={guardarPlatillo}
+          />
+        ))}
 
       {tab === 'nueva' && (
         <section className="max-w-2xl space-y-4 rounded-2xl border border-zinc-800 bg-zinc-950/50 p-6">
           <h2 className="text-lg font-semibold text-white">Registrar orden</h2>
-          <p className="text-sm text-zinc-500">IVA 16 % sobre subtotal. La mesa pasa a Ocupada al crear la orden.</p>
+          <p className="text-sm text-zinc-500">
+            Propina 10 % sobre subtotal. Solo mesas <strong className="text-zinc-300">Disponibles</strong> pueden usarse; la
+            mesa pasa a Ocupada al crear la orden.
+          </p>
           {loading ? (
             <div className="h-40 animate-pulse rounded-xl border border-zinc-800 bg-zinc-900/40" />
           ) : (
@@ -414,8 +497,13 @@ export default function GestionPage() {
                   >
                     <option value="">—</option>
                     {mesas.map((m) => (
-                      <option key={m.mesa_id} value={String(m.mesa_id)}>
-                        #{m.numero_mesa} (cap. {m.capacidad})
+                      <option
+                        key={m.mesa_id}
+                        value={String(m.mesa_id)}
+                        disabled={m.estado !== 'Disponible'}
+                      >
+                        #{m.numero_mesa} (cap. {m.capacidad}) — {m.estado}
+                        {m.estado !== 'Disponible' ? ' · no seleccionable' : ''}
                       </option>
                     ))}
                   </select>
@@ -521,9 +609,8 @@ export default function GestionPage() {
         <section className="space-y-3">
           <h2 className="text-lg font-semibold text-white">Órdenes</h2>
           <p className="text-sm text-zinc-500">
-            Registra pagos desde &quot;Detalle / pago&quot;. Si la suma de pagos cubre el total, la orden pasa a{' '}
-            <strong className="text-zinc-300">Pagada</strong> y la mesa vuelve a{' '}
-            <strong className="text-zinc-300">Disponible</strong>.
+            Flujo: Pendiente → Preparando → Servida → Pagada (o Cancelada). Los pagos cubren el total y marcan Pagada;
+            la mesa queda Disponible al pagar o cancelar. No se puede marcar Pagada sin pagos suficientes.
           </p>
           {loading ? (
             <div className="h-40 animate-pulse rounded-2xl border border-zinc-800 bg-zinc-900/40" />
@@ -552,8 +639,9 @@ export default function GestionPage() {
                     {modalData.orden.empleado_nombre} · <StatusBadge status={modalData.orden.estado} />
                   </p>
                   <p className="mt-1">
-                    Subtotal {Number(modalData.orden.subtotal).toFixed(2)} + IVA {Number(modalData.orden.impuesto).toFixed(2)}{' '}
-                    = Total <strong className="text-white">{Number(modalData.orden.total).toFixed(2)}</strong>
+                    Subtotal {Number(modalData.orden.subtotal).toFixed(2)} + Propina (10 %){' '}
+                    {Number(modalData.orden.impuesto).toFixed(2)} = Total{' '}
+                    <strong className="text-white">{Number(modalData.orden.total).toFixed(2)}</strong>
                   </p>
                 </div>
                 <div>

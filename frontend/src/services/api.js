@@ -36,9 +36,14 @@ export async function getDashboard() {
   return data.data;
 }
 
-export async function getBackups() {
-  const { data } = await api.get('/api/backups');
+export async function getBackups(params) {
+  const { data } = await api.get('/api/backups', { params });
   return data.data;
+}
+
+export async function getRestorableBackups() {
+  const { data } = await api.get('/api/backups', { params: { restorable: true } });
+  return { versions: data.data || [], retentionDays: data.retention_days ?? 0 };
 }
 
 export async function createBackup(payload) {
@@ -108,8 +113,23 @@ export async function patchEmpleadoEstado(empleadoId, estado) {
   return data.data;
 }
 
+export async function getCategoriasGestion() {
+  const { data } = await api.get('/api/gestion/categorias');
+  return data.data;
+}
+
 export async function getPlatillosGestion() {
   const { data } = await api.get('/api/gestion/platillos');
+  return data.data;
+}
+
+export async function postPlatillo(payload) {
+  const { data } = await api.post('/api/gestion/platillos', payload);
+  return data.data;
+}
+
+export async function patchPlatillo(platilloId, payload) {
+  const { data } = await api.patch(`/api/gestion/platillos/${platilloId}`, payload);
   return data.data;
 }
 

@@ -66,6 +66,26 @@ async function platillosList(req, res, next) {
   }
 }
 
+async function platilloCreate(req, res, next) {
+  try {
+    const data = await gestionService.createPlatillo(req.body || {});
+    res.status(201).json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+}
+
+async function platilloPatch(req, res, next) {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) throw badId('ID de platillo inválido');
+    const data = await gestionService.updatePlatillo(id, req.body || {});
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+}
+
 async function clientesList(req, res, next) {
   try {
     const data = await gestionService.listClientes();
@@ -141,6 +161,8 @@ module.exports = {
   empleadoPatch,
   categoriasList,
   platillosList,
+  platilloCreate,
+  platilloPatch,
   clientesList,
   ordenesList,
   ordenGet,
